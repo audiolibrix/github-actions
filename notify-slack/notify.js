@@ -23,15 +23,48 @@ module.exports = async function notifySlack({ github, context, core }) {
 async function describeRun(github, context) {
   const { owner, repo } = context.repo;
   const repoUrl = `${context.serverUrl}/${owner}/${repo}`;
+  const slackIds = await readSlackIds();
   return {
     title: process.env.NOTIFY_TITLE || repo,
     shortSha: context.sha.slice(0, 7),
     commitTitle: await readCommitTitle(github, context),
     commitUrl: `${repoUrl}/commit/${context.sha}`,
     runUrl: `${repoUrl}/actions/runs/${context.runId}`,
-    actor: context.actor,
+    // U opakovaného běhu je `actor` ten, kdo běh spustil poprvé.
+    triggeredBy: formatMention(process.env.GITHUB_TRIGGERING_ACTOR || context.actor, slackIds),
+    repoOwners: parseLogins(process.env.NOTIFY_OWNER).map((login) => formatMention(login, slackIds)),
     trigger: describeTrigger(context),
   };
+}
+
+// GitHub login → Slack member ID ze slack-users.json v privátním repu.
+// Bez tokenu, nebo když se mapování nenačte, zpráva uvede jen loginy.
+async function readSlackIds() {
+  const token = process.env.NOTIFY_PEOPLE_TOKEN;
+  if (!token) return {};
+  try {
+    const url = `${process.env.GITHUB_API_URL}/repos/${process.env.NOTIFY_PEOPLE_REPOSITORY}/contents/slack-users.json`;
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github.raw+json' },
+    });
+    if (!response.ok) throw new Error(`GitHub odpověděl ${response.status}`);
+    const slackIds = await response.json();
+    // Loginy jsou na GitHubu bez ohledu na velikost písmen.
+    return Object.fromEntries(Object.entries(slackIds).map(([login, id]) => [login.toLowerCase(), id]));
+  } catch (error) {
+    console.log(`Mapování na Slack ID se nepodařilo načíst: ${error.message}`);
+    return {};
+  }
+}
+
+// Loginy oddělené mezerami nebo čárkami, `@` nepovinný.
+function parseLogins(text = '') {
+  return text.split(/[\s,]+/).filter(Boolean).map((login) => login.replace(/^@/, ''));
+}
+
+function formatMention(login, slackIds) {
+  const slackId = slackIds[login.toLowerCase()];
+  return slackId ? `<@${slackId}>` : escapeSlack(login);
 }
 
 // Push nese zprávu commitu v payloadu, ruční spuštění ani tag ne — pak se
@@ -138,7 +171,8 @@ function formatCommit(run) {
 }
 
 function formatOrigin(run) {
-  return `Spustil: ${run.actor} · ${run.trigger}`;
+  const owners = run.repoOwners.length > 0 ? ` · vlastník: ${run.repoOwners.join(', ')}` : '';
+  return `Spustil: ${run.triggeredBy} · ${run.trigger}${owners}`;
 }
 
 // Slack v textu zprávy bere &, < a > jako řídicí znaky (odkazy, zmínky).
