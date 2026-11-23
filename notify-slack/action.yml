@@ -11,6 +11,11 @@
 #
 #   uses: audiolibrix/github-actions/notify-slack@v1
 #
+# Zprávy tagují toho, kdo běh spustil, a vlastníka repa (input `owner`).
+# Slack ID k GitHub loginům sem do veřejného repa nepatří.
+# Jsou v souboru slack-users.json v privátním repu, které čte GitHub App
+# s právem jen na to repo. Bez ní zprávy uvedou jen loginy.
+#
 # Selhání notifikace běh neshodí — Slack, který zrovna neodpovídá, nemá
 # zastavit nasazení. Skončí to varováním v logu.
 name: Notifikace do Slacku
@@ -40,12 +45,48 @@ inputs:
     description: Token na čtení jobů a commitu přes API.
     required: false
     default: ${{ github.token }}
+  owner:
+    description: GitHub login vlastníka repa, víc loginů oddělte mezerou. Bez něj zpráva vlastníka neuvede.
+    required: false
+  people-repository:
+    description: Privátní repo (`owner/repo`) se souborem slack-users.json, který mapuje GitHub login na Slack member ID.
+    required: false
+  people-client-id:
+    description: Client ID GitHub App, která to repo čte.
+    required: false
+  people-private-key:
+    description: Privátní klíč té GitHub App.
+    required: false
 
 runs:
   using: composite
   steps:
+    # Token se vydává instalaci v organizaci repa s mapováním, ne volajícího.
+    - id: people-owner
+      if: inputs.people-repository != '' && inputs.people-client-id != '' && inputs.people-private-key != ''
+      shell: bash
+      env:
+        PEOPLE_REPOSITORY: ${{ inputs.people-repository }}
+      run: echo "owner=${PEOPLE_REPOSITORY%%/*}" >> "$GITHUB_OUTPUT"
+
+    # Token jen na čtení toho jednoho repa, i kdyby aplikace jednou směla víc.
+    # Když se nepovede, zpráva odejde bez tagů.
+    - id: people-token
+      if: steps.people-owner.outputs.owner != ''
+      continue-on-error: true
+      uses: actions/create-github-app-token@v3
+      with:
+        client-id: ${{ inputs.people-client-id }}
+        private-key: ${{ inputs.people-private-key }}
+        owner: ${{ steps.people-owner.outputs.owner }}
+        repositories: ${{ inputs.people-repository }}
+        permission-contents: read
+
     - uses: actions/github-script@v8
       env:
+        NOTIFY_OWNER: ${{ inputs.owner }}
+        NOTIFY_PEOPLE_REPOSITORY: ${{ inputs.people-repository }}
+        NOTIFY_PEOPLE_TOKEN: ${{ steps.people-token.outputs.token }}
         NOTIFY_WEBHOOK: ${{ inputs.webhook }}
         NOTIFY_EVENT: ${{ inputs.event }}
         NOTIFY_TITLE: ${{ inputs.title }}
