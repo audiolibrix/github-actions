@@ -1,0 +1,238 @@
+# Release aplikace přes release-it: povýší verzi, pushne release commit a tag
+# a na tagu spustí deploy. Volá ho workflow volajícího repa:
+#
+#   jobs:
+#     release:
+#       permissions:
+#         contents: write   # push release commitu a tagu
+#         actions: write    # spuštění deploye a stav CI
+#       uses: audiolibrix/github-actions/.github/workflows/release.yml@v1
+#       with:
+#         bot: jmeno-bota[bot]
+#
+# Push jde vestavěným tokenem workflow, takže repo nepotřebuje klíč žádné
+# GitHub App. Tag pushnutý tímhle tokenem ale žádné workflow nespustí (GitHub
+# tak brání nekonečným smyčkám), proto release spustí deploy sám přes
+# workflow_dispatch, na který tahle výjimka neplatí.
+#
+# Ruční běh vydá, co je v hlavní větvi. Plánovaný běh (`scheduled`) vydá, jen
+# když jsou všechny commity od posledního tagu od bota z inputu `bot`, a se
+# `security` jen když jsou to samé bezpečnostní opravy (Renovate jim dává na
+# konec názvu [SECURITY]). Release se dělá jen nad zeleným CI. Když aktualizace
+# čekají za jinou prací, přijde to do Slacku.
+#
+# Volající repo potřebuje release-it v devDependencies, jeho nastavení
+# (.release-it.json) a deploy workflow s `workflow_dispatch`.
+name: Release
+
+on:
+  workflow_call:
+    inputs:
+      bot:
+        description: GitHub login bota, který merguje aktualizace, třeba `renovate[bot]`. Pod jeho jménem vznikne i release commit a tag.
+        type: string
+        required: true
+      increment:
+        description: Která část verze se zvedne, `patch`, `minor` nebo `major`.
+        type: string
+        default: patch
+      scheduled:
+        description: Vydat, jen když jsou od posledního tagu všechny commity od bota.
+        type: boolean
+        default: false
+      security:
+        description: Se `scheduled` vydat, jen když jsou od posledního tagu samé bezpečnostní opravy.
+        type: boolean
+        default: false
+      node-version:
+        description: Verze Node, pod kterou poběží release-it.
+        type: string
+        default: "26"
+      ci-workflow:
+        description: Soubor workflow s CI, jehož běh na posledním commitu musí být zelený.
+        type: string
+        default: ci.yml
+      deploy-workflow:
+        description: Soubor workflow s deployem, spustí se na novém tagu.
+        type: string
+        default: deploy.yml
+      title:
+        description: Jméno, pod kterým se release ohlásí ve Slacku. Bez něj jméno repozitáře.
+        type: string
+        required: false
+      owner:
+        description: GitHub login vlastníka repa, zpráva do Slacku ho označí.
+        type: string
+        required: false
+      people-repository:
+        description: Repo s mapováním GitHub loginů na Slack ID, viz notify-slack.
+        type: string
+        required: false
+      people-client-id:
+        description: Client ID GitHub App, která to repo smí číst.
+        type: string
+        required: false
+    secrets:
+      slack_webhook:
+        description: URL incoming webhooku Slacku.
+        required: true
+      people_private_key:
+        description: Soukromý klíč GitHub App, která čte repo s mapováním.
+        required: false
+      npmrc:
+        description: Řádek navíc do ~/.npmrc, třeba token k privátnímu registru, bez kterého neprojde npm ci.
+        required: false
+
+jobs:
+  decide:
+    name: Rozhodnout o releasu
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      decision: ${{ steps.decide.outputs.decision }}
+      sha: ${{ steps.decide.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      # release: vydat teď
+      # waiting: aktualizace od bota čekají za jinou prací
+      # none:    není co vydat
+      - name: Rozhodnout
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOT: ${{ inputs.bot }}
+          CI_WORKFLOW: ${{ inputs.ci-workflow }}
+          IS_MANUAL: ${{ !inputs.scheduled }}
+          IS_SECURITY_ONLY: ${{ inputs.security }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+          last_tag=$(git describe --tags --abbrev=0 --match 'v*')
+          authors=$(git log --format='%an' "$last_tag..HEAD" | sort -u)
+          echo "Od $last_tag:"
+          git log --format='  %h %an: %s' "$last_tag..HEAD"
+
+          if [ -z "$authors" ]; then
+            decision=none
+          elif [ "$IS_MANUAL" = true ] || [ "$authors" = "$BOT" ]; then
+            decision=release
+          elif grep -qxF "$BOT" <<< "$authors"; then
+            decision=waiting
+          else
+            decision=none
+          fi
+
+          if [ "$IS_SECURITY_ONLY" = true ] && [ "$decision" != none ]; then
+            subjects=$(git log --format='%s' "$last_tag..HEAD")
+            if ! grep -qF '[SECURITY]' <<< "$subjects"; then
+              echo "Od $last_tag žádná bezpečnostní oprava, a jen ty tenhle běh vydává."
+              decision=none
+            elif grep -vqF '[SECURITY]' <<< "$subjects"; then
+              echo "Bezpečnostní oprava čeká za jinými změnami od $last_tag."
+              decision=waiting
+            fi
+          fi
+
+          if [ "$decision" = release ]; then
+            ci=$(gh run list --workflow "$CI_WORKFLOW" --commit "$sha" --event push \
+              --json status,conclusion --jq '.[0] | "\(.status)/\(.conclusion)"')
+            if [ "$ci" != completed/success ]; then
+              echo "::warning::CI na $sha je '${ci:-žádné}', release se nedělá."
+              decision=none
+            fi
+          fi
+
+          echo "Rozhodnutí: $decision"
+          echo "decision=$decision" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Vydat a spustit deploy
+    needs: decide
+    if: needs.decide.outputs.decision == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Zastavit, když se větev od rozhodnutí posunula
+        env:
+          DECIDED_SHA: ${{ needs.decide.outputs.sha }}
+        run: |
+          [ "$(git rev-parse HEAD)" = "$DECIDED_SHA" ] || {
+            echo "Větev se po rozhodnutí posunula, rozhodne další běh." >&2
+            exit 1
+          }
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Nainstalovat release-it
+        env:
+          NPMRC: ${{ secrets.npmrc }}
+        run: |
+          [ -z "$NPMRC" ] || echo "$NPMRC" >> ~/.npmrc
+          npm ci
+
+      # Jméno a e-mail bota: GitHub pak commit i tag ukáže pod ním, i když je
+      # pushne vestavěný token.
+      - name: Commitovat pod jménem bota
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOT: ${{ inputs.bot }}
+        run: |
+          user_id=$(gh api "/users/$(jq -rn --arg login "$BOT" '$login | @uri')" --jq .id)
+          git config user.name "$BOT"
+          git config user.email "${user_id}+${BOT}@users.noreply.github.com"
+
+      - name: Vydat
+        env:
+          INCREMENT: ${{ inputs.increment }}
+        run: npx release-it "$INCREMENT" --ci
+
+      - name: Spustit deploy na tagu
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_WORKFLOW: ${{ inputs.deploy-workflow }}
+        run: |
+          tag=$(git describe --tags --exact-match HEAD)
+          gh workflow run "$DEPLOY_WORKFLOW" --ref "$tag"
+          echo "Deploy spuštěný na $tag."
+
+  announce:
+    name: Ohlásit
+    needs: [decide, release]
+    if: always() && (needs.decide.outputs.decision == 'waiting' || contains(needs.*.result, 'failure'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: audiolibrix/github-actions/notify-slack@v1
+        with:
+          webhook: ${{ secrets.slack_webhook }}
+          owner: ${{ inputs.owner }}
+          people-repository: ${{ inputs.people-repository }}
+          people-client-id: ${{ inputs.people-client-id }}
+          people-private-key: ${{ secrets.people_private_key }}
+          event: result
+          title: ${{ inputs.title }}
+          needs: ${{ toJSON(needs) }}
+          success-text: >-
+            Aktualizace čekají na release: od posledního tagu je v hlavní větvi
+            i jiná práce a tu automat nevydá. Vydej ji přes Actions → Release →
+            Run workflow.
+          failure-text: Automatický release se nepovedl, na produkci se nic nezměnilo.
