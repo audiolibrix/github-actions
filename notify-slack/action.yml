@@ -82,7 +82,7 @@ runs:
         repositories: ${{ inputs.people-repository }}
         permission-contents: read
 
-    - uses: actions/github-script@v8
+    - uses: actions/github-script@v9
       env:
         NOTIFY_OWNER: ${{ inputs.owner }}
         NOTIFY_PEOPLE_REPOSITORY: ${{ inputs.people-repository }}
