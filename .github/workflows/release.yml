@@ -93,6 +93,7 @@ jobs:
     outputs:
       decision: ${{ steps.decide.outputs.decision }}
       sha: ${{ steps.decide.outputs.sha }}
+      bot-id: ${{ steps.decide.outputs.bot_id }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -111,6 +112,14 @@ jobs:
           IS_MANUAL: ${{ !inputs.scheduled }}
           IS_SECURITY_ONLY: ${{ inputs.security }}
         run: |
+          # Překlep v `bot` by jinak plánovaný běh neshodil, jen by nikdy nic
+          # nevydal, protože by autorům commitů nikdy neodpovídal.
+          bot_id=$(gh api "/users/$(jq -rn --arg login "$BOT" '$login | @uri')" --jq .id) || {
+            echo "::error::Účet '$BOT' z inputu bot na GitHubu není, zkontroluj překlep."
+            exit 1
+          }
+          echo "bot_id=$bot_id" >> "$GITHUB_OUTPUT"
+
           sha=$(git rev-parse HEAD)
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
@@ -191,12 +200,11 @@ jobs:
       # pushne vestavěný token.
       - name: Commitovat pod jménem bota
         env:
-          GH_TOKEN: ${{ github.token }}
           BOT: ${{ inputs.bot }}
+          BOT_ID: ${{ needs.decide.outputs.bot-id }}
         run: |
-          user_id=$(gh api "/users/$(jq -rn --arg login "$BOT" '$login | @uri')" --jq .id)
           git config user.name "$BOT"
-          git config user.email "${user_id}+${BOT}@users.noreply.github.com"
+          git config user.email "${BOT_ID}+${BOT}@users.noreply.github.com"
 
       - name: Vydat
         env:
